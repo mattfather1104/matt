@@ -29,20 +29,29 @@
   }
   #startOverlay button:hover { background:#2fb958; }
   #startOverlay .hint { font-size:12px; color:#aaa; max-width:320px; text-align:center; }
+  #startOverlay label.botsOption { font-size:14px; display:flex; align-items:center; gap:6px; cursor:pointer; }
+  #botsToggleBtn {
+    position:absolute; top:44px; left:10px; pointer-events:auto; font-size:12px;
+    padding:5px 10px; border-radius:6px; border:1px solid #666; background:rgba(20,20,20,0.55);
+    color:#fff; cursor:pointer;
+  }
+  #botsToggleBtn.on { border-color:#3fdc6a; color:#8ff0ab; }
 </style>
 </head>
 <body>
 <canvas id="game"></canvas>
 <div id="hud">
   <div id="status">連線中...</div>
+  <button id="botsToggleBtn">🤖 機器人：關閉</button>
   <div id="leaderboard"></div>
   <div id="deathOverlay">你被擊殺了<br><span id="respawnCountdown"></span></div>
 </div>
 <div id="startOverlay">
   <h1>🎮 Tank Arena 多人對戰</h1>
   <input id="nameInput" maxlength="12" placeholder="輸入你的名字">
+  <label class="botsOption"><input type="checkbox" id="botsCheckbox"> 生成電腦機器人（預設關閉）</label>
   <button id="joinBtn">加入戰鬥</button>
-  <div class="hint">WASD 移動、滑鼠瞄準、按住滑鼠左鍵或空白鍵開火。這是簡化版：目前沒有電腦機器人、沒有升級系統，純粹真人對戰。</div>
+  <div class="hint">WASD 移動、滑鼠瞄準、按住滑鼠左鍵或空白鍵開火。這是簡化版：沒有升級系統，純粹對戰。是否要電腦機器人可以自己選，進去之後也能隨時切換。</div>
 </div>
 
 <script>
@@ -56,6 +65,9 @@
   const startOverlay = document.getElementById('startOverlay');
   const nameInput = document.getElementById('nameInput');
   const joinBtn = document.getElementById('joinBtn');
+  const botsCheckbox = document.getElementById('botsCheckbox');
+  const botsToggleBtn = document.getElementById('botsToggleBtn');
+  let botsEnabled = false; // synced from the server's own state broadcast, not just our own guess
 
   function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
   window.addEventListener('resize', resize);
@@ -112,6 +124,7 @@
     ws.addEventListener('open', () => {
       statusEl.textContent = '已連線';
       ws.send(JSON.stringify({ t: 'setName', name }));
+      if (botsCheckbox.checked) ws.send(JSON.stringify({ t: 'setBotsEnabled', enabled: true }));
     });
     ws.addEventListener('close', () => { statusEl.textContent = '連線中斷，重新整理頁面再試一次'; });
     ws.addEventListener('error', () => { statusEl.textContent = '連線發生錯誤'; });
@@ -126,6 +139,9 @@
       } else if (msg.t === 'state') {
         latestPlayers = msg.players;
         latestBullets = msg.bullets;
+        botsEnabled = !!msg.botsEnabled;
+        botsToggleBtn.textContent = '🤖 機器人：' + (botsEnabled ? '開啟' : '關閉');
+        botsToggleBtn.classList.toggle('on', botsEnabled);
       }
     });
 
@@ -143,6 +159,10 @@
     canvas.focus();
   });
   nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') joinBtn.click(); });
+  botsToggleBtn.addEventListener('click', () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ t: 'setBotsEnabled', enabled: !botsEnabled }));
+  });
 
   function worldToScreen(x, y) {
     return [x - camera.x + canvas.width/2, y - camera.y + canvas.height/2];
