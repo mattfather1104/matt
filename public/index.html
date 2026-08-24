@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<title>Tank Arena - 多人對戰</title>
+<style>
+  html, body { margin:0; padding:0; overflow:hidden; background:#1b1b1b; font-family: "Segoe UI", Arial, sans-serif; }
+  #game { display:block; background:#cdcdcd; cursor: crosshair; }
+  #hud { position:fixed; left:0; top:0; width:100%; height:100%; pointer-events:none; color:#fff; text-shadow: 0 0 4px rgba(0,0,0,0.6); }
+  #leaderboard { position:absolute; top:10px; right:10px; min-width:160px; background:rgba(20,20,20,0.55); border-radius:6px; padding:8px 10px; font-size:13px; }
+  #leaderboard .row { display:flex; justify-content:space-between; gap:12px; padding:2px 0; }
+  #status { position:absolute; top:10px; left:10px; font-size:13px; }
+  #deathOverlay {
+    position:absolute; left:50%; top:40%; transform:translate(-50%,-50%);
+    text-align:center; font-size:22px; font-weight:bold; display:none;
+  }
+  #startOverlay {
+    position:fixed; left:0; top:0; width:100%; height:100%; background:rgba(20,20,20,0.92);
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px;
+    color:#fff; pointer-events:auto;
+  }
+  #startOverlay h1 { margin:0; font-size:28px; }
+  #startOverlay input {
+    padding:10px 14px; font-size:16px; border-radius:6px; border:2px solid #555; width:220px; text-align:center;
+  }
+  #startOverlay button {
+    padding:10px 28px; font-size:16px; font-weight:bold; border:none; border-radius:6px;
+    background:#3fdc6a; color:#123; cursor:pointer;
+  }
+  #startOverlay button:hover { background:#2fb958; }
+  #startOverlay .hint { font-size:12px; color:#aaa; max-width:320px; text-align:center; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud">
+  <div id="status">連線中...</div>
+  <div id="leaderboard"></div>
+  <div id="deathOverlay">你被擊殺了<br><span id="respawnCountdown"></span></div>
+</div>
+<div id="startOverlay">
+  <h1>🎮 Tank Arena 多人對戰</h1>
+  <input id="nameInput" maxlength="12" placeholder="輸入你的名字">
+  <button id="joinBtn">加入戰鬥</button>
+  <div class="hint">WASD 移動、滑鼠瞄準、按住滑鼠左鍵或空白鍵開火。這是簡化版：目前沒有電腦機器人、沒有升級系統，純粹真人對戰。</div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const statusEl = document.getElementById('status');
+  const leaderboardEl = document.getElementById('leaderboard');
+  const deathOverlay = document.getElementById('deathOverlay');
+  const respawnCountdownEl = document.getElementById('respawnCountdown');
+  const startOverlay = document.getElementById('startOverlay');
+  const nameInput = document.getElementById('nameInput');
+  const joinBtn = document.getElementById('joinBtn');
+
+  function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+  window.addEventListener('resize', resize);
+  resize();
+
+  let ws = null;
+  let myId = null;
+  let world = { w: 2000, h: 2000 };
+  let playerRadius = 20, bulletRadius = 6;
+
+  // render state: smoothed toward whatever the last server snapshot said, so a 20Hz network
+  // update rate doesn't look like a visible stutter every frame
+  let renderPlayers = new Map(); // id -> {x,y,angle,...} smoothed
+  let latestPlayers = [];
+  let latestBullets = [];
+  const camera = { x: world.w/2, y: world.h/2 };
+
+  const keys = { w:false, a:false, s:false, d:false };
+  let mouseX = 0, mouseY = 0, firing = false;
+
+  window.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (k === 'w' || k === 'arrowup') keys.w = true;
+    else if (k === 'a' || k === 'arrowleft') keys.a = true;
+    else if (k === 's' || k === 'arrowdown') keys.s = true;
+    else if (k === 'd' || k === 'arrowright') keys.d = true;
+    else if (k === ' ') firing = true;
+  });
+  window.addEventListener('keyup', (e) => {
+    const k = e.key.toLowerCase();
+    if (k === 'w' || k === 'arrowup') keys.w = false;
+    else if (k === 'a' || k === 'arrowleft') keys.a = false;
+    else if (k === 's' || k === 'arrowdown') keys.s = false;
+    else if (k === 'd' || k === 'arrowright') keys.d = false;
+    else if (k === ' ') firing = false;
+  });
+  canvas.addEventListener('mousemove', (e) => { mouseX = e.clientX; mouseY = e.clientY; });
+  canvas.addEventListener('mousedown', () => { firing = true; });
+  canvas.addEventListener('mouseup', () => { firing = false; });
+
+  function currentAngle() { return Math.atan2(mouseY - canvas.height/2, mouseX - canvas.width/2); }
+  function currentMove() {
+    let mvx = 0, mvy = 0;
+    if (keys.w) mvy -= 1;
+    if (keys.s) mvy += 1;
+    if (keys.a) mvx -= 1;
+    if (keys.d) mvx += 1;
+    return { mvx, mvy };
+  }
+
+  function connect(name) {
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    ws = new WebSocket(proto + location.host + '/ws');
+    ws.addEventListener('open', () => {
+      statusEl.textContent = '已連線';
+      ws.send(JSON.stringify({ t: 'setName', name }));
+    });
+    ws.addEventListener('close', () => { statusEl.textContent = '連線中斷，重新整理頁面再試一次'; });
+    ws.addEventListener('error', () => { statusEl.textContent = '連線發生錯誤'; });
+    ws.addEventListener('message', (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.t === 'welcome') {
+        myId = msg.id;
+        world = msg.world;
+        playerRadius = msg.playerRadius;
+        bulletRadius = msg.bulletRadius;
+      } else if (msg.t === 'state') {
+        latestPlayers = msg.players;
+        latestBullets = msg.bullets;
+      }
+    });
+
+    setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const { mvx, mvy } = currentMove();
+      ws.send(JSON.stringify({ t: 'input', mvx, mvy, angle: currentAngle(), firing }));
+    }, 50);
+  }
+
+  joinBtn.addEventListener('click', () => {
+    const name = nameInput.value.trim() || ('玩家' + Math.floor(Math.random()*1000));
+    startOverlay.style.display = 'none';
+    connect(name);
+    canvas.focus();
+  });
+  nameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') joinBtn.click(); });
+
+  function worldToScreen(x, y) {
+    return [x - camera.x + canvas.width/2, y - camera.y + canvas.height/2];
+  }
+
+  function drawGrid() {
+    ctx.strokeStyle = 'rgba(0,0,0,0.08)';
+    ctx.lineWidth = 1;
+    const GRID = 80;
+    const startX = camera.x - canvas.width/2, startY = camera.y - canvas.height/2;
+    ctx.beginPath();
+    for (let x = Math.floor(startX/GRID)*GRID; x < startX + canvas.width + GRID; x += GRID) {
+      const [sx] = worldToScreen(x, 0);
+      ctx.moveTo(sx, 0); ctx.lineTo(sx, canvas.height);
+    }
+    for (let y = Math.floor(startY/GRID)*GRID; y < startY + canvas.height + GRID; y += GRID) {
+      const [, sy] = worldToScreen(0, y);
+      ctx.moveTo(0, sy); ctx.lineTo(canvas.width, sy);
+    }
+    ctx.stroke();
+  }
+
+  function drawWorldBounds() {
+    const [x0, y0] = worldToScreen(0, 0);
+    const [x1, y1] = worldToScreen(world.w, world.h);
+    ctx.strokeStyle = '#8a8a8a';
+    ctx.lineWidth = 4;
+    ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+  }
+
+  function drawHpBar(sx, sy, w, h, ratio) {
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(sx - w/2, sy, w, h);
+    ctx.fillStyle = ratio > 0.5 ? '#3fdc6a' : (ratio > 0.25 ? '#e8c85c' : '#e85c5c');
+    ctx.fillRect(sx - w/2, sy, w * Math.max(0, ratio), h);
+  }
+
+  function drawTank(p) {
+    const [sx, sy] = worldToScreen(p.x, p.y);
+    if (sx < -60 || sx > canvas.width+60 || sy < -60 || sy > canvas.height+60) return;
+    const r = playerRadius;
+
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(p.angle);
+    ctx.fillStyle = '#8a8a8a';
+    ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+    ctx.lineWidth = 2;
+    ctx.fillRect(0, -r*0.35, r*1.6, r*0.7);
+    ctx.strokeRect(0, -r*0.35, r*1.6, r*0.7);
+    ctx.restore();
+
+    ctx.beginPath();
+    ctx.arc(sx, sy, r, 0, Math.PI*2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = p.outline || '#333';
+    ctx.stroke();
+
+    drawHpBar(sx, sy + r + 10, Math.max(46, r*1.8), 6, p.hp / p.maxHp);
+    ctx.font = '12px "Segoe UI", Arial, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(p.name + (p.id === myId ? ' (你)' : ''), sx, sy + r + 26);
+  }
+
+  function drawBullet(b) {
+    const [sx, sy] = worldToScreen(b.x, b.y);
+    if (sx < -20 || sx > canvas.width+20 || sy < -20 || sy > canvas.height+20) return;
+    ctx.beginPath();
+    ctx.arc(sx, sy, bulletRadius, 0, Math.PI*2);
+    ctx.fillStyle = '#ffe066';
+    ctx.fill();
+  }
+
+  function updateRenderPlayers() {
+    const seen = new Set();
+    for (const p of latestPlayers) {
+      seen.add(p.id);
+      let rp = renderPlayers.get(p.id);
+      if (!rp) { rp = { ...p }; renderPlayers.set(p.id, rp); }
+      // exponential smoothing toward the latest authoritative position -- simple and cheap;
+      // a future pass could add real client-side prediction for the local player specifically
+      const smoothing = 0.35;
+      rp.x += (p.x - rp.x) * smoothing;
+      rp.y += (p.y - rp.y) * smoothing;
+      rp.angle = p.angle;
+      rp.hp = p.hp; rp.maxHp = p.maxHp; rp.alive = p.alive;
+      rp.name = p.name; rp.color = p.color; rp.outline = p.outline; rp.score = p.score;
+      rp.id = p.id;
+    }
+    for (const id of [...renderPlayers.keys()]) {
+      if (!seen.has(id)) renderPlayers.delete(id);
+    }
+  }
+
+  function updateLeaderboard() {
+    const rows = [...latestPlayers].sort((a,b) => b.score - a.score)
+      .map(p => `<div class="row"><span>${p.name}${p.id===myId?' (你)':''}</span><span>${p.score}</span></div>`)
+      .join('');
+    leaderboardEl.innerHTML = '<div class="row"><b>排行榜</b><b>擊殺</b></div>' + rows;
+  }
+
+  function loop() {
+    updateRenderPlayers();
+    updateLeaderboard();
+
+    const me = renderPlayers.get(myId);
+    if (me) {
+      camera.x += (me.x - camera.x) * 0.25;
+      camera.y += (me.y - camera.y) * 0.25;
+      const meLatest = latestPlayers.find(p => p.id === myId);
+      if (meLatest && !meLatest.alive) {
+        deathOverlay.style.display = 'block';
+        respawnCountdownEl.textContent = '等待重生...';
+      } else {
+        deathOverlay.style.display = 'none';
+      }
+    }
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#cdcdcd';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    drawGrid();
+    drawWorldBounds();
+    for (const b of latestBullets) drawBullet(b);
+    for (const p of renderPlayers.values()) drawTank(p);
+
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
