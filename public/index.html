@@ -5,7 +5,7 @@
 <title>Tank Arena - 多人對戰</title>
 <style>
   html, body { margin:0; padding:0; overflow:hidden; background:#1b1b1b; font-family: "Segoe UI", Arial, sans-serif; }
-  #game { display:block; background:#cdcdcd; cursor: crosshair; }
+  #game { display:block; background:#cdcdcd; cursor: crosshair; touch-action: none; }
   #hud { position:fixed; left:0; top:0; width:100%; height:100%; pointer-events:none; color:#fff; text-shadow: 0 0 4px rgba(0,0,0,0.6); }
   #leaderboard { position:absolute; top:10px; right:10px; min-width:160px; background:rgba(20,20,20,0.55); border-radius:6px; padding:8px 10px; font-size:13px; }
   #leaderboard .row { display:flex; justify-content:space-between; gap:12px; padding:2px 0; }
@@ -108,14 +108,85 @@
   canvas.addEventListener('mousedown', () => { firing = true; });
   canvas.addEventListener('mouseup', () => { firing = false; });
 
-  function currentAngle() { return Math.atan2(mouseY - canvas.height/2, mouseX - canvas.width/2); }
+  // 手機雙搖桿：左邊管移動方向，右邊管炮台方向並自動開火。是「浮動」搖桿 -- 手指按在畫面
+  // 左/右半邊的任何位置就會在那個位置生成搖桿基座，不用精準按在一個小圈圈上
+  const isTouchDevice = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+  const STICK_MAX_R = 55;
+  function makeStick() { return { active: false, pointerId: null, baseX: 0, baseY: 0, dx: 0, dy: 0 }; }
+  const leftStick = makeStick(), rightStick = makeStick();
+
+  function stickPos(e) {
+    const rect = canvas.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+  canvas.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch') return;
+    const { x, y } = stickPos(e);
+    const stick = x < canvas.width / 2 ? leftStick : rightStick;
+    if (stick.active) return; // that side is already held down by another finger
+    stick.active = true;
+    stick.pointerId = e.pointerId;
+    stick.baseX = x; stick.baseY = y;
+    stick.dx = 0; stick.dy = 0;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* not fatal -- move/up still work without capture */ }
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (e.pointerType !== 'touch') return;
+    const { x, y } = stickPos(e);
+    for (const stick of [leftStick, rightStick]) {
+      if (!stick.active || stick.pointerId !== e.pointerId) continue;
+      let dx = x - stick.baseX, dy = y - stick.baseY;
+      const len = Math.hypot(dx, dy);
+      if (len > STICK_MAX_R) { dx = dx / len * STICK_MAX_R; dy = dy / len * STICK_MAX_R; }
+      stick.dx = dx; stick.dy = dy;
+    }
+  });
+  function releaseStick(e) {
+    if (e.pointerType !== 'touch') return;
+    for (const stick of [leftStick, rightStick]) {
+      if (stick.active && stick.pointerId === e.pointerId) {
+        stick.active = false; stick.pointerId = null; stick.dx = 0; stick.dy = 0;
+      }
+    }
+  }
+  canvas.addEventListener('pointerup', releaseStick);
+  canvas.addEventListener('pointercancel', releaseStick);
+
+  function currentAngle() {
+    if (rightStick.active && Math.hypot(rightStick.dx, rightStick.dy) > 4) {
+      return Math.atan2(rightStick.dy, rightStick.dx);
+    }
+    return Math.atan2(mouseY - canvas.height/2, mouseX - canvas.width/2);
+  }
   function currentMove() {
+    if (leftStick.active) {
+      return { mvx: leftStick.dx / STICK_MAX_R, mvy: leftStick.dy / STICK_MAX_R };
+    }
     let mvx = 0, mvy = 0;
     if (keys.w) mvy -= 1;
     if (keys.s) mvy += 1;
     if (keys.a) mvx -= 1;
     if (keys.d) mvx += 1;
     return { mvx, mvy };
+  }
+  function currentFiring() { return firing || rightStick.active; }
+
+  function drawStick(stick, defaultX, defaultY) {
+    const bx = stick.active ? stick.baseX : defaultX;
+    const by = stick.active ? stick.baseY : defaultY;
+    ctx.beginPath();
+    ctx.arc(bx, by, STICK_MAX_R, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    const hx = bx + (stick.active ? stick.dx : 0);
+    const hy = by + (stick.active ? stick.dy : 0);
+    ctx.beginPath();
+    ctx.arc(hx, hy, STICK_MAX_R*0.45, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.fill();
   }
 
   function connect(name) {
@@ -148,7 +219,7 @@
     setInterval(() => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const { mvx, mvy } = currentMove();
-      ws.send(JSON.stringify({ t: 'input', mvx, mvy, angle: currentAngle(), firing }));
+      ws.send(JSON.stringify({ t: 'input', mvx, mvy, angle: currentAngle(), firing: currentFiring() }));
     }, 50);
   }
 
@@ -291,6 +362,11 @@
     drawWorldBounds();
     for (const b of latestBullets) drawBullet(b);
     for (const p of renderPlayers.values()) drawTank(p);
+
+    if (isTouchDevice) {
+      drawStick(leftStick, 90, canvas.height - 90);
+      drawStick(rightStick, canvas.width - 90, canvas.height - 90);
+    }
 
     requestAnimationFrame(loop);
   }
